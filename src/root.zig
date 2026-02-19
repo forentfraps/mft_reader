@@ -2,6 +2,31 @@ const std = @import("std");
 const builtin = @import("builtin");
 const win = std.os.windows;
 
+pub extern "kernel32" fn SetFilePointerEx(
+    hFile: win.HANDLE,
+    liDistanceToMove: win.LARGE_INTEGER,
+    lpNewFilePointer: ?*win.LARGE_INTEGER,
+    dwMoveMethod: win.DWORD,
+) callconv(.winapi) win.BOOL;
+
+pub extern "kernel32" fn ReadFile(
+    hFile: win.HANDLE,
+    lpBuffer: [*]u8,
+    nNumberOfBytesToRead: win.DWORD,
+    lpNumberOfBytesRead: ?*win.DWORD,
+    lpOverlapped: ?*win.OVERLAPPED,
+) callconv(.winapi) win.BOOL;
+
+pub extern "kernel32" fn CreateFileW(
+    lpFileName: [*:0]const win.WCHAR,
+    dwDesiredAccess: win.DWORD,
+    dwShareMode: win.DWORD,
+    lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES,
+    dwCreationDisposition: win.DWORD,
+    dwFlagsAndAttributes: win.DWORD,
+    hTemplateFile: ?win.HANDLE,
+) callconv(.winapi) win.HANDLE;
+
 // NTFS $MFT-based file reader (Windows only)
 
 pub const std_options: std.Options = .{
@@ -16,7 +41,7 @@ pub const std_options: std.Options = .{
 const log = std.log.scoped(.ntfs);
 
 fn logWinErr(prefix: []const u8) void {
-    const code = win.kernel32.GetLastError();
+    const code = win.GetLastError();
     log.err("{s}: GetLastError={d}", .{ prefix, code });
 }
 
@@ -66,22 +91,33 @@ fn deviceIoControl(
         "DeviceIoControl(code=0x{x}, in={d}, out={d})",
         .{ code, if (in_buf) |b| b.len else 0, out_buf.len },
     );
-    win.DeviceIoControl(
+
+    var io_status_block: win.IO_STATUS_BLOCK = std.mem.zeroes(win.IO_STATUS_BLOCK);
+    const ctl_code: *const win.CTL_CODE = @ptrCast(&code);
+
+    const s = win.ntdll.NtDeviceIoControlFile(
         h,
-        code,
-        in_buf,
-        out_buf,
-    ) catch |e| {
-        log.err("DeviceIoControl failed: {s}", .{@errorName(e)});
+        null,
+        null,
+        null,
+        &io_status_block,
+        ctl_code.*,
+        if (in_buf) |in_buf_deref| in_buf_deref.ptr else null,
+        if (in_buf) |in_buf_deref| @truncate(in_buf_deref.len) else 0,
+        out_buf.ptr,
+        @truncate(out_buf.len),
+    );
+    if (s != .SUCCESS) {
+        log.err("DeviceIoControl failed: {X}", .{(s)});
         logWinErr("DeviceIoControl");
         return error.DeviceIoControlFailed;
-    };
+    }
 }
 
 fn setFilePointer(h: win.HANDLE, off: u64) !void {
     const ioff: i64 = @bitCast(off);
     log.debug("SetFilePointerEx(off=0x{x})", .{off});
-    if (win.kernel32.SetFilePointerEx(
+    if (SetFilePointerEx(
         h,
         ioff,
         null,
@@ -95,7 +131,7 @@ fn setFilePointer(h: win.HANDLE, off: u64) !void {
 fn readAt(h: win.HANDLE, off: u64, buf: []u8) !usize {
     try setFilePointer(h, off);
     var br: win.DWORD = 0;
-    if (win.kernel32.ReadFile(
+    if (ReadFile(
         h,
         buf.ptr,
         @as(win.DWORD, @intCast(buf.len)),
@@ -537,6 +573,7 @@ fn extractDataRunsFromRecord(
 
             const runs = try parseRunlist(alloc, record[run_ofs .. off + alen]);
 
+            // std.debug.print("ah name len {d}\n", .{ah.name_len});
             // If caller doesn't care about the named stream, return immediately.
             if (ah.name_len == 0 or maybe_name_utf16 == null) return runs;
 
@@ -829,11 +866,17 @@ pub fn ntfsReadFileByPath(
     defer alloc.free(segs);
 
     var i: usize = 0;
+    var stream_name: ?[]const u8 = null;
     while (i < segs.len) : (i += 1) {
         const rec = try readMftRecord(alloc, vol, cur_rec_no);
         defer alloc.free(rec);
 
-        const child = try dirLookupName(alloc, vol, rec, segs[i]);
+        var it = std.mem.splitScalar(u8, segs[i], ':');
+        const name = it.next().?;
+        if (it.next()) |str_name| {
+            stream_name = str_name;
+        }
+        const child = try dirLookupName(alloc, vol, rec, name);
         if (child) |mftn| {
             cur_rec_no = mftn;
         } else {
@@ -852,7 +895,26 @@ pub fn ntfsReadFileByPath(
         const ah: *align(1) const AttrHeaderCommon = @ptrCast(rec.ptr + off);
         if (ah.type == @intFromEnum(ATTR_TYPE.END)) break;
         if (ah.type != @intFromEnum(ATTR_TYPE.DATA)) continue;
-        if (ah.name_len != 0) continue;
+        if (ah.name_len != 0) {
+            if (stream_name == null) continue;
+            const attr_matches = blk: {
+                if (stream_name) |want_stream| {
+                    if (ah.name_len == 0) break :blk false;
+                    const name_bytes = rec[off + ah.name_ofs .. off + ah.name_ofs + @as(usize, ah.name_len) * 2];
+                    const name16_ptr: [*]align(1) const u16 = @ptrCast(name_bytes.ptr);
+                    const name16 = name16_ptr[0..ah.name_len];
+                    const want16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, want_stream);
+                    defer alloc.free(want16);
+                    break :blk eqUtf16CaseInsensitive(name16, want16);
+                } else {
+                    break :blk ah.name_len == 0;
+                }
+            };
+            if (!attr_matches) continue;
+        }
+        if (ah.name_len == 0 and stream_name != null) {
+            continue;
+        }
 
         if (ah.nonresident == 0) {
             const rs: *align(1) const AttrHeaderResident = @ptrCast(rec.ptr + off + @sizeOf(AttrHeaderCommon));
@@ -925,16 +987,16 @@ pub fn MftReadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     const wvol = try toWideZ(alloc, vol_utf8);
     defer alloc.free(wvol);
 
-    const share = win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE;
-    const access: win.DWORD = win.GENERIC_READ;
+    const share = 1 | 2 | 4;
+    const access: win.DWORD = 0x80000000;
 
-    const h = win.kernel32.CreateFileW(
+    const h = CreateFileW(
         wvol.ptr,
         access,
         share,
         null,
-        win.OPEN_EXISTING,
-        win.FILE_ATTRIBUTE_NORMAL,
+        3,
+        0x80,
         null,
     );
     if (h == win.INVALID_HANDLE_VALUE) {

@@ -5,11 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const is_windows = target.result.os.tag == .windows;
 
-    const mft_mod = b.createModule(.{
+    const mft_mod = b.addModule("mft_reader", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+
     const mft_exe = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -36,7 +37,7 @@ pub fn build(b: *std.Build) void {
             .name = "mft_reader",
             .root_module = mft_mod,
         });
-        lib.linkLibC();
+        lib.root_module.link_libc = true;
         b.installArtifact(lib);
     }
 

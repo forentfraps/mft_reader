@@ -4,7 +4,7 @@ const win = std.os.windows;
 
 const root = @import("root.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) {
         std.debug.print("Windows-only.\n", .{});
         return;
@@ -13,8 +13,8 @@ pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     const alloc = gpa.allocator();
     {
-        const args = try std.process.argsAlloc(alloc);
-        defer std.process.argsFree(alloc, args);
+        const arena_alloc = init.arena.allocator();
+        const args = try init.minimal.args.toSlice(arena_alloc);
 
         if (args.len < 2) {
             std.debug.print(
