@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zigwin32 = b.dependency("zigwin32", .{});
+    mft_mod.addImport("zigwin32", zigwin32.module("win32"));
 
     const mft_exe = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -23,6 +25,7 @@ pub fn build(b: *std.Build) void {
             .root_module = mft_exe,
         });
         exe.root_module.addImport("mft_reader", mft_mod);
+        exe.root_module.addImport("zigwin32", zigwin32.module("win32"));
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);

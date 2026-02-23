@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const win = std.os.windows;
 
 const root = @import("root.zig");
 

@@ -1,31 +1,32 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const win = std.os.windows;
+const winz = std.os.windows;
+const win = @import("zigwin32").everything;
 
-pub extern "kernel32" fn SetFilePointerEx(
-    hFile: win.HANDLE,
-    liDistanceToMove: win.LARGE_INTEGER,
-    lpNewFilePointer: ?*win.LARGE_INTEGER,
-    dwMoveMethod: win.DWORD,
-) callconv(.winapi) win.BOOL;
-
-pub extern "kernel32" fn ReadFile(
-    hFile: win.HANDLE,
-    lpBuffer: [*]u8,
-    nNumberOfBytesToRead: win.DWORD,
-    lpNumberOfBytesRead: ?*win.DWORD,
-    lpOverlapped: ?*win.OVERLAPPED,
-) callconv(.winapi) win.BOOL;
-
-pub extern "kernel32" fn CreateFileW(
-    lpFileName: [*:0]const win.WCHAR,
-    dwDesiredAccess: win.DWORD,
-    dwShareMode: win.DWORD,
-    lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES,
-    dwCreationDisposition: win.DWORD,
-    dwFlagsAndAttributes: win.DWORD,
-    hTemplateFile: ?win.HANDLE,
-) callconv(.winapi) win.HANDLE;
+// pub extern "kernel32" fn SetFilePointerEx(
+//     hFile: win.HANDLE,
+//     liDistanceToMove: win.LARGE_INTEGER,
+//     lpNewFilePointer: ?*win.LARGE_INTEGER,
+//     dwMoveMethod: win.DWORD,
+// ) callconv(.winapi) win.BOOL;
+//
+// pub extern "kernel32" fn ReadFile(
+//     hFile: win.HANDLE,
+//     lpBuffer: [*]u8,
+//     nNumberOfBytesToRead: win.DWORD,
+//     lpNumberOfBytesRead: ?*win.DWORD,
+//     lpOverlapped: ?*win.OVERLAPPED,
+// ) callconv(.winapi) win.BOOL;
+//
+// pub extern "kernel32" fn CreateFileW(
+//     lpFileName: [*:0]const win.WCHAR,
+//     dwDesiredAccess: win.DWORD,
+//     dwShareMode: win.DWORD,
+//     lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES,
+//     dwCreationDisposition: win.DWORD,
+//     dwFlagsAndAttributes: win.DWORD,
+//     hTemplateFile: ?win.HANDLE,
+// ) callconv(.winapi) win.HANDLE;
 
 // NTFS $MFT-based file reader (Windows only)
 
@@ -57,7 +58,7 @@ fn ceilDivU64(a: u64, b: u64) u64 {
     return (a + b - 1) / b;
 }
 
-const IOCTL_STORAGE_QUERY_PROPERTY: win.DWORD = 0x002D1400;
+const IOCTL_STORAGE_QUERY_PROPERTY: winz.DWORD = 0x002D1400;
 const FILE_BEGIN = 0;
 
 const StoragePropertyId = enum(u32) {
@@ -83,8 +84,8 @@ const STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR = extern struct {
 
 fn deviceIoControl(
     h: win.HANDLE,
-    code: win.DWORD,
-    in_buf: ?[]const u8,
+    code: winz.DWORD,
+    in_buf: ?[]u8,
     out_buf: []u8,
 ) !void {
     log.debug(
@@ -93,21 +94,20 @@ fn deviceIoControl(
     );
 
     var io_status_block: win.IO_STATUS_BLOCK = std.mem.zeroes(win.IO_STATUS_BLOCK);
-    const ctl_code: *const win.CTL_CODE = @ptrCast(&code);
 
-    const s = win.ntdll.NtDeviceIoControlFile(
+    const s = win.NtDeviceIoControlFile(
         h,
         null,
         null,
         null,
         &io_status_block,
-        ctl_code.*,
+        code,
         if (in_buf) |in_buf_deref| in_buf_deref.ptr else null,
         if (in_buf) |in_buf_deref| @truncate(in_buf_deref.len) else 0,
         out_buf.ptr,
         @truncate(out_buf.len),
     );
-    if (s != .SUCCESS) {
+    if (s != 0) {
         log.err("DeviceIoControl failed: {X}", .{(s)});
         logWinErr("DeviceIoControl");
         return error.DeviceIoControlFailed;
@@ -117,11 +117,11 @@ fn deviceIoControl(
 fn setFilePointer(h: win.HANDLE, off: u64) !void {
     const ioff: i64 = @bitCast(off);
     log.debug("SetFilePointerEx(off=0x{x})", .{off});
-    if (SetFilePointerEx(
+    if (win.SetFilePointerEx(
         h,
-        ioff,
+        .{ .QuadPart = ioff },
         null,
-        FILE_BEGIN,
+        .BEGIN,
     ) == 0) {
         logWinErr("SetFilePointerEx");
         return error.SeekFailed;
@@ -130,11 +130,11 @@ fn setFilePointer(h: win.HANDLE, off: u64) !void {
 
 fn readAt(h: win.HANDLE, off: u64, buf: []u8) !usize {
     try setFilePointer(h, off);
-    var br: win.DWORD = 0;
-    if (ReadFile(
+    var br: winz.DWORD = 0;
+    if (win.ReadFile(
         h,
         buf.ptr,
-        @as(win.DWORD, @intCast(buf.len)),
+        @as(winz.DWORD, @intCast(buf.len)),
         &br,
         null,
     ) == 0) {
@@ -987,16 +987,13 @@ pub fn MftReadFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     const wvol = try toWideZ(alloc, vol_utf8);
     defer alloc.free(wvol);
 
-    const share = 1 | 2 | 4;
-    const access: win.DWORD = 0x80000000;
-
-    const h = CreateFileW(
+    const h = win.CreateFileW(
         wvol.ptr,
-        access,
-        share,
+        .{ ._31 = 1 }, //GENERIC_READ
+        .{ .DELETE = 1, .READ = 1, .WRITE = 1 },
         null,
-        3,
-        0x80,
+        .OPEN_EXISTING,
+        .{ .FILE_ATTRIBUTE_NORMAL = 1 },
         null,
     );
     if (h == win.INVALID_HANDLE_VALUE) {
